@@ -6,13 +6,15 @@ public struct JoltPressStyle: ButtonStyle {
   public var pressed: JoltPose
   public var hovered: JoltPose
   public var transition: JoltTransition
+  public var shadowColor: Color
   public init(
     pressed: JoltPose = try! .init(scale: 0.96), hovered: JoltPose = try! .init(scale: 1.03),
-    transition: JoltTransition = .spring(.snappy)
+    transition: JoltTransition = .spring(.snappy), shadowColor: Color = .black
   ) {
     self.pressed = pressed
     self.hovered = hovered
     self.transition = transition
+    self.shadowColor = shadowColor
   }
   public func makeBody(configuration: Configuration) -> some View {
     configuration.label.modifier(PressContent(isPressed: configuration.isPressed, style: self))
@@ -22,45 +24,50 @@ public struct JoltPressStyle: ButtonStyle {
     let style: JoltPressStyle
     @State private var hovering = false
     @Environment(\.isEnabled) private var enabled
-    @Environment(\.scenePhase) private var phase
+    @JoltSceneActivity private var sceneActive
     func body(content: Content) -> some View {
       content.contentShape(Rectangle()).joltMotion(
-        to: enabled && phase == .active
+        to: enabled && sceneActive
           ? (isPressed ? style.pressed : hovering ? style.hovered : .identity) : .identity,
-        transition: style.transition
+        transition: style.transition, shadowColor: style.shadowColor,
+        consumesPerspective: [style.pressed, style.hovered].contains {
+          $0.rotateX != 0 || $0.rotateY != 0
+        }
       )
-      .onHover { hovering = $0 && enabled && phase == .active }
-      .onChange(of: phase) { _, _ in hovering = false }
+      .onHover { hovering = $0 && enabled && sceneActive }
+      .onChange(of: sceneActive) { _, _ in hovering = false }
       .onChange(of: enabled) { _, _ in hovering = false }
       .onDisappear { hovering = false }
+      .modifier(JoltActivityProvider($sceneActive))
     }
   }
 }
 
 public struct JoltPointerSample: Equatable, Sendable {
-  /// -1...1, relative to the untransformed source's local bounds. Origin is top-left.
+  /// -1...1 across the untransformed source's local bounds: (-1, -1) is the top-left corner.
   public let x: Double
   public let y: Double
   public let active: Bool
   public static let center = Self(x: 0, y: 0, active: false)
+  static func resolve(_ location: CGPoint?, in size: CGSize, enabled: Bool) -> Self {
+    guard enabled, size.width > 0, size.height > 0, let location,
+      (0...size.width).contains(location.x), (0...size.height).contains(location.y)
+    else { return .center }
+    return .init(
+      x: location.x / size.width * 2 - 1, y: location.y / size.height * 2 - 1, active: true)
+  }
 }
 private struct PointerModifier: ViewModifier {
   let update: @MainActor (JoltPointerSample) -> Void
   @State private var size: CGSize = .zero
   @State private var location: CGPoint?
-  @Environment(\.scenePhase) private var phase
+  @JoltSceneActivity private var sceneActive
+  @Environment(\.isEnabled) private var enabled
   @Environment(\.accessibilityReduceMotion) private var reduced
   @Environment(\.joltReduceMotion) private var appReduced
   private func publish() {
-    guard phase == .active, !reduced, !appReduced, size.width > 0, size.height > 0, let location
-    else {
-      update(.center)
-      return
-    }
     update(
-      .init(
-        x: min(1, max(-1, location.x / size.width * 2 - 1)),
-        y: min(1, max(-1, location.y / size.height * 2 - 1)), active: true))
+      .resolve(location, in: size, enabled: enabled && sceneActive && !reduced && !appReduced))
   }
   func body(content: Content) -> some View {
     content.background(
@@ -79,15 +86,16 @@ private struct PointerModifier: ViewModifier {
       case .ended: location = nil
       }
       publish()
-    }.onChange(of: phase) { _, _ in
+    }.onChange(of: sceneActive) { _, _ in
       location = nil
       publish()
     }
-    .onChange(of: reduced || appReduced) { _, _ in publish() }
+    .onChange(of: reduced || appReduced || !enabled) { _, _ in publish() }
     .onDisappear {
       location = nil
       update(.center)
     }
+    .modifier(JoltActivityProvider($sceneActive))
   }
 }
 extension View {

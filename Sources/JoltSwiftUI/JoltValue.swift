@@ -41,6 +41,7 @@ public enum JoltPlaybackState: String, Sendable {
   private var finishers: [UUID: @MainActor (Bool) -> Void] = [:]
   private var generation = 0
   private(set) var lease: UUID?
+  private var leaseLost: (@MainActor () -> Void)?
   public init(_ initial: Double, clock: JoltClock = .shared) throws {
     guard initial.isFinite, abs(initial) <= 1e12 else { throw JoltError.invalidMotion }
     value = initial
@@ -53,12 +54,13 @@ public enum JoltPlaybackState: String, Sendable {
     guard next.isFinite, abs(next) <= 1e12 else { throw JoltError.invalidMotion }
     let callbacks = detachMotion()
     generation += 1
-    lease = nil
+    let lost = dropLease()
     target = next
     velocity = 0
     state = .idle
     publish(next)
     for callback in callbacks { callback(false) }
+    lost?()
   }
   /// Replacement springs inherit sampled velocity. Completion reports false on cancellation/replacement.
   public func animate(
@@ -74,7 +76,7 @@ public enum JoltPlaybackState: String, Sendable {
       transition: transition)
     let oldFinishers = detachMotion()
     generation += 1
-    lease = nil
+    let lost = dropLease()
     let epoch = generation
     motion = .scalar(candidate)
     elapsed = 0
@@ -82,6 +84,7 @@ public enum JoltPlaybackState: String, Sendable {
     target = next
     if let completion { finishers[UUID()] = completion }
     for callback in oldFinishers { callback(false) }
+    lost?()
     guard !disposed, generation == epoch else { return }
     if let sample {
       velocity = sample.velocity
@@ -106,7 +109,7 @@ public enum JoltPlaybackState: String, Sendable {
     )
     let old = detachMotion()
     generation += 1
-    lease = nil
+    let lost = dropLease()
     let epoch = generation
     motion = .decay(candidate)
     elapsed = 0
@@ -114,6 +117,7 @@ public enum JoltPlaybackState: String, Sendable {
     target = candidate.to
     if let completion { finishers[UUID()] = completion }
     for callback in old { callback(false) }
+    lost?()
     guard !disposed, generation == epoch else { return }
     if let sample {
       velocity = sample.velocity
@@ -127,11 +131,12 @@ public enum JoltPlaybackState: String, Sendable {
     let sample = currentSample()
     let callbacks = detachMotion()
     generation += 1
-    lease = nil
+    let lost = dropLease()
     velocity = 0
     state = .cancelled
     if let sample { publish(sample.position) }
     for callback in callbacks { callback(false) }
+    lost?()
   }
   public func pause() {
     guard !disposed, !paused else { return }
@@ -159,12 +164,13 @@ public enum JoltPlaybackState: String, Sendable {
     guard !disposed else { return }
     let callbacks = detachMotion()
     generation += 1
-    lease = nil
+    let lost = dropLease()
     disposed = true
     velocity = 0
     state = .disposed
     observers.removeAll()
     for callback in callbacks { callback(false) }
+    lost?()
   }
   /// A scoped spring follower. The returned resource owns the subscription, not the borrowed source/value.
   public func follow(_ source: JoltMotionValue, transition: JoltTransition = .spring(.smooth))
@@ -181,11 +187,14 @@ public enum JoltPlaybackState: String, Sendable {
     observers[id] = callback
     return JoltObservation { [weak self] in self?.observers.removeValue(forKey: id) }
   }
-  func claim(_ owner: UUID) {
+  func claim(_ owner: UUID, lost: (@MainActor () -> Void)? = nil) {
     let epoch = generation
     cancel()
     // A cancellation callback can synchronously install a newer owner.
-    if !disposed, generation == epoch + 1, motion == nil { lease = owner }
+    if !disposed, generation == epoch + 1, motion == nil {
+      lease = owner
+      leaseLost = lost
+    }
   }
   func sample(_ sample: JoltScalarSample, target next: Double, owner: UUID) {
     guard !disposed, lease == owner else { return }
@@ -203,8 +212,15 @@ public enum JoltPlaybackState: String, Sendable {
   func relinquish(_ owner: UUID, cancelled: Bool) {
     guard lease == owner else { return }
     lease = nil
+    leaseLost = nil
     velocity = 0
     state = cancelled ? .cancelled : .completed
+  }
+  private func dropLease() -> (@MainActor () -> Void)? {
+    let lost = lease == nil ? nil : leaseLost
+    lease = nil
+    leaseLost = nil
+    return lost
   }
   private func publish(_ next: Double) {
     guard value != next else { return }
@@ -323,7 +339,17 @@ public enum JoltPlaybackState: String, Sendable {
 }
 
 public enum JoltValueProperty: String, CaseIterable, Sendable {
-  case x, y, scale, scaleX, scaleY, rotate, opacity
+  case x, y, scale, scaleX, scaleY, rotate, rotateX, rotateY, opacity
+}
+extension JoltValueProperty {
+  var tilts: Bool { self == .rotateX || self == .rotateY }
+  func channels(_ scalar: Double) -> JoltDepthChannels {
+    .init(
+      x: self == .x ? scalar : 0, y: self == .y ? scalar : 0,
+      scaleX: self == .scale || self == .scaleX ? scalar : 1,
+      scaleY: self == .scale || self == .scaleY ? scalar : 1, rotate: self == .rotate ? scalar : 0,
+      rotateX: self == .rotateX ? scalar : 0, rotateY: self == .rotateY ? scalar : 0)
+  }
 }
 private struct ValueModifier: ViewModifier {
   @ObservedObject var value: JoltMotionValue
@@ -335,18 +361,18 @@ private struct ValueModifier: ViewModifier {
   }
   func body(content: Content) -> some View {
     content
-      .offset(x: property == .x ? scalar : 0, y: property == .y ? scalar : 0)
-      .scaleEffect(
-        x: property == .scale || property == .scaleX ? scalar : 1,
-        y: property == .scale || property == .scaleY ? scalar : 1
+      .modifier(
+        JoltDepthModifier(
+          channels: property == .opacity ? .init() : property.channels(scalar),
+          consumes: property.tilts)
       )
-      .rotationEffect(.degrees(property == .rotate ? scalar : 0))
       .opacity(property == .opacity ? min(1, max(0, scalar)) : 1)
       .transaction { $0.animation = nil }
   }
 }
 extension View {
   /// Bind a sampled value without applying a second implicit interpolation. Scope owns its lifecycle.
+  /// rotateX/rotateY project under the nearest `joltPerspective`; bind both axes with one call.
   public func joltBind(_ property: JoltValueProperty, to value: JoltMotionValue) -> some View {
     modifier(ValueModifier(value: value, property: property))
   }
